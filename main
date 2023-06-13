@@ -1,0 +1,229 @@
+import urequests
+import machine
+import dht
+import time
+from machine import Pin
+from machine import ADC
+from machine import PWM
+import socket
+from i2c_lcd import *
+from lcd_api import *
+from umail import SMTP
+
+
+# Configuración del servidor SMTP y las credenciales de correo electrónico
+smtp_server = 'smtp.gmail.com'
+smtp_port = 587
+smtp_username = 'mariajosmm30@gmail.com'
+smtp_password = 'injobdcnrbwcdbcm'
+
+# Configuración del correo electrónico
+from_address = 'mariajosmm30@gmail.com'
+to_address = 'mjmoncayo@gmail.com'
+subject = 'Alerta de Sensor MQ135'
+body = 'El sensor MQ135 ha detectado un valor mayor a 160. Hay una posible contaminación del aire.'
+
+# Configuración de los pines
+DHT_PIN = 14
+MQ_PIN = 34
+VENT_PIN = 26
+
+# Configuración del umbral del sensor MQ135
+MQ_THRESHOLD = 50
+
+# Inicializar los sensores
+dht_sensor = dht.DHT11(Pin(DHT_PIN))
+mq_sensor = ADC(Pin(MQ_PIN))
+vent_pin = PWM(Pin(VENT_PIN), freq=5000, duty=0)
+
+# Variable para almacenar el estado del ventilador
+vent_status = False
+vent_manual_control = False
+
+# Variables para el promedio móvil
+N = 10  # Número de valores para promediar
+valores = []
+valor_promedio = 0
+
+# Configuración de la pantalla LCD
+I2C_ADDR = 0x27
+totalRows = 2
+totalColumns = 16
+
+I2C_SCL_PIN = 22
+I2C_SDA_PIN = 21
+
+i2c = machine.I2C(0, scl=machine.Pin(I2C_SCL_PIN), sda=machine.Pin(I2C_SDA_PIN), freq=10000)
+lcd = I2cLcd(i2c, I2C_ADDR, totalRows, totalColumns)
+
+# Leer los valores de los sensores
+def read_sensors():
+    time.sleep(5)
+    global vent_manual_control, valores, valor_promedio
+    try:
+        dht_sensor.measure()
+        temperature = dht_sensor.temperature()
+        humidity = dht_sensor.humidity()
+
+        # Leer varios valores del sensor MQ135 y obtener el promedio
+        mq_values = []
+        for _ in range(N):
+            if mq_values:
+                mq_values.pop(0)
+        for _ in range(N):
+            mq_values.append(mq_sensor.read())
+            time.sleep(0.1)
+        
+        mq_value = sum(mq_values) / len(mq_values)
+        
+        print('Control manual:', vent_manual_control)
+        if vent_manual_control:
+            return temperature, humidity, valor_promedio
+        
+        # Calcular el promedio móvil
+        for _ in range(N):
+            if valores:
+                valores.pop(0)
+        valores.append(mq_value)
+        if len(valores) > N:
+            valores = valores[1:]  # Eliminar el valor más antiguo
+        valor_promedio = sum(valores) / len(valores)
+        
+        # Controlar el ventilador automáticamente
+        if valor_promedio > MQ_THRESHOLD:
+            control_fan(True)
+            send_alert_email()
+            send_to_database(temperature, humidity, mq_value)
+            print('Ingreso Notificacion:', valor_promedio)
+        else:
+            control_fan(False)
+            print('Salio:', valor_promedio)
+            
+        
+        return temperature, humidity, valor_promedio
+    except OSError as e:
+        lcd.clear()
+        lcd.putstr("Failed sensor.")
+        return 0, 0, 0
+    
+# Enviar mensaje a Bases de datos
+def send_to_database(temperature, humidity, mq_value):
+    try:
+        url = "http://192.168.179.77/esp32/connection.php?temperatura="+ str(temperature) +"&humedad="+ str(humidity) +"&aire=" + str(mq_value) 
+        response = urequests.get(url)
+        response.close()
+        return response.status_code == 200
+    except Exception as e:
+        print('Error al enviar datos a la BD:', e)
+        return False
+
+# Controlar el ventilador
+def control_fan(activate):
+    global vent_status
+    if activate:
+        vent_pin.duty(1023)  # Encender el ventilador al máximo
+        vent_status = True
+    else:
+        vent_pin.duty(0)  # Apagar el ventilador
+        vent_status = False
+
+# Mostrar los valores en la pantalla LCD
+def show_lcd(temperature, humidity, mq_value):
+    lcd.clear()
+    lcd.putstr("Temp: {0} C\n".format(temperature))
+    lcd.putstr("MQ135: {0}".format(mq_value))
+
+# Crear un servidor web básico
+def start_server():
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.bind(('0.0.0.0', 80))
+    server_socket.listen(5)
+    print('Servidor web iniciado')
+
+    while True:
+        client_socket, addr = server_socket.accept()
+        print('Cliente conectado:', addr)
+        
+        request = client_socket.recv(1024)
+        request_str = str(request, 'utf-8')
+        print('Solicitud:', request_str)
+        
+        temperature, humidity, mq_value = read_sensors()
+
+        if 'POST /vent' in request_str:
+            if 'vent_status=Activar+ventilador' in request_str:
+                vent_manual_control = True
+                control_fan(True)
+            elif 'vent_status=Apagar+ventilador' in request_str:
+                vent_manual_control = True
+                control_fan(False)
+            else:
+                vent_manual_control = False
+        
+        response = 'HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n'
+        response += '<html><head>'
+        response += '<meta  http-equiv="refresh" content="2">'
+        response += '<style>'
+        response += 'body {font-family: Arial, sans-serif; background-color: #F4F4F4; padding: 20px;}'
+        response += '.sensor {background-color: #FFFFFF; border: 1px solid #CCCCCC; padding: 10px; margin-bottom: 10px;}'
+        response += 'h1 {font-size: 24px; color: #333333;}'
+        response += 'h2 {font-size: 18px; color: #666666;}'
+        response += '.bar {background-color: #4CAF50; height: 20px; margin-top: 5px;}'
+        response += '</style>'
+        response += '</head>'
+        response += '<body>'
+        response += '<h1>Mediciones de sensores</h1>'
+        
+        response += '<div class="sensor">'
+        response += '<h2>Temperatura</h2>'
+        response += '<div class="bar" style="width: {}%;"></div>'.format(temperature)
+        response += '<p>{}°C</p>'.format(temperature)
+        response += '</div>'
+        
+        response += '<div class="sensor">'
+        response += '<h2>Humedad</h2>'
+        response += '<div class="bar" style="width: {}%;"></div>'.format(humidity)
+        response += '<p>{}%</p>'.format(humidity)
+        response += '</div>'
+        
+        response += '<div class="sensor">'
+        response += '<h2>Valor MQ135</h2>'
+        response += '<div class="bar" style="width: {}%;"></div>'.format(mq_value)
+        response += '<p>{}</p>'.format(mq_value)
+        response += '</div>'
+        
+        response += '<div class="sensor">'
+        response += '<h2>Ventilador</h2>'
+        response += '<form method="POST" action="/vent">'
+        
+        if vent_status:
+            response += '<p>El ventilador está encendido</p>'
+            response += '<input type="submit" name="vent_status" value="Apagar ventilador">'
+        else:
+            response += '<p>El ventilador está apagado</p>'
+            response += '<input type="submit" name="vent_status" value="Activar ventilador">'
+        
+        response += '</form>'
+        response += '</div>'
+        
+        response += '</body></html>'
+        
+        client_socket.sendall(response.encode())
+        client_socket.close()
+        
+        show_lcd(temperature, humidity, mq_value)
+
+# Envío del correo electrónico de alerta
+def send_alert_email():
+    smtp = SMTP(smtp_server, smtp_port, username=smtp_username, password=smtp_password)
+    smtp.to(to_address)
+    smtp.write("From: {}\r\n".format(from_address))
+    smtp.write("To: {}\r\n".format(to_address))
+    smtp.write("Subject: {}\r\n".format(subject))
+    smtp.write("\r\n")
+    smtp.write(body)
+    smtp.send()
+    smtp.quit()
+
+# Ejecución del servidor web
+start_server()
